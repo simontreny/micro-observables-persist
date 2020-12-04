@@ -1,47 +1,63 @@
 import jsan from "jsan";
 import { BaseObservable, Observable, Plugin, WritableObservable } from "micro-observables";
-import { PersistOptions } from "./options";
-import { Storage } from "./storage";
+import { PersistConfiguration, PersistOptions } from "./types";
 
 const storageMetaKey = "micro-observables-persist:meta";
-
-interface Configuration {
-  storage: Storage;
-  // verbose?: boolean;
-  // saveDebounce?: number;
-}
 
 interface StorageMeta {
   keys: Set<string>;
 }
 
-interface LoadedState {
+interface RestoredState {
   [key: string]: string;
 }
 
-export class PersistPlugin implements Plugin {
-  private _config: Configuration;
-  private _meta: StorageMeta = { keys: new Set() };
-  private _loadedState: LoadedState = {};
+interface PersistOptionsInternal extends PersistOptions {
+  _persistRestoring: boolean
+}
 
-  private constructor(config: Configuration) {
+export class PersistPlugin implements Plugin {
+  private _config: PersistConfiguration;
+  private _meta: StorageMeta = { keys: new Set() };
+  private _restoredState: RestoredState | null = null
+  private _observablesToRestore: { [key: string]: WritableObservable<any> } = {}
+  
+  constructor(config: PersistConfiguration) {
     this._config = config;
   }
 
-  static async init(config: Configuration): Promise<PersistPlugin> {
-    const plugin = new PersistPlugin(config);
-    await plugin.loadStateFromStorage();
-    return plugin;
+  async restore(): Promise<void> {
+    const { storage } = this._config;
+
+    const serializedMeta = await storage.getItem(storageMetaKey);
+    const meta = (serializedMeta ? jsan.parse(serializedMeta) : { keys: new Set() }) as StorageMeta;
+
+    const restoredState: RestoredState = {}
+    for (const key of meta.keys) {
+      const serializedValue = await storage.getItem(key);
+      if (serializedValue !== null) {
+        restoredState[key] = serializedValue;
+      }
+    }
+
+    this._meta = meta;
+    this._restoredState = restoredState;
+    
+    for (const key of Object.keys(this._observablesToRestore)) {
+      this.restoreValueToObservable(key, this._observablesToRestore[key])
+    }
+    this._observablesToRestore = {}
   }
 
   onCreate(observable: BaseObservable<any>) {
     if (observable instanceof WritableObservable) {
       const key = keyForObservable(observable);
-      if (key && this._loadedState[key] !== undefined) {
-        const { fromJson } = observable.options<PersistOptions>();
-        const json = jsan.parse(this._loadedState[key]);
-        observable.set(fromJson ? fromJson(json) : json);
-        delete this._loadedState[key];
+      if (key) {
+        if (!this._restoredState) {
+          this._observablesToRestore[key] = observable
+        } else {
+          this.restoreValueToObservable(key, observable)
+        }
       }
     }
   }
@@ -50,27 +66,30 @@ export class PersistPlugin implements Plugin {
     if (observable instanceof WritableObservable) {
       const key = keyForObservable(observable);
       if (key) {
-        const { toJson } = observable.options<PersistOptions>();
-        const json = toJson ? toJson(val) : val;
-        const serialized = jsan.stringify(json, undefined, undefined, true);
-        this.saveValueToStorage(key, serialized);
+        const { toJson, _persistRestoring } = observable.options<PersistOptionsInternal>();
+        if (!_persistRestoring) {
+          const json = toJson ? toJson(val) : val;
+          const serialized = jsan.stringify(json, undefined, undefined, true);
+          this.saveValueToStorage(key, serialized);
+        }
       }
     }
   }
 
-  private async loadStateFromStorage(): Promise<void> {
-    const { storage } = this._config;
-
-    const serializedMeta = await storage.getItem(storageMetaKey);
-    if (serializedMeta !== null) {
-      this._meta = jsan.parse(serializedMeta) as StorageMeta;
-    }
-
-    for (const key of this._meta.keys) {
-      const serializedValue = await storage.getItem(key);
-      if (serializedValue !== null) {
-        this._loadedState[key] = serializedValue;
+  private restoreValueToObservable(key: string, observable: WritableObservable<any>) {
+    if (this._restoredState && this._restoredState[key] !== undefined) {
+      const { fromJson } = observable.options<PersistOptions>();
+      const json = jsan.parse(this._restoredState[key]);
+      const value = fromJson ? fromJson(json) : json
+      
+      try {
+        observable.withOptions<PersistOptionsInternal>({ _persistRestoring: true })
+        observable.set(value);
+      } finally {
+        observable.withOptions<PersistOptionsInternal>({ _persistRestoring: false })
       }
+      
+      delete this._restoredState[key];  
     }
   }
 
@@ -78,7 +97,7 @@ export class PersistPlugin implements Plugin {
     const { storage } = this._config;
 
     await storage.setItem(key, value);
-
+    
     if (!this._meta.keys.has(key)) {
       this._meta.keys.add(key);
       await storage.setItem(storageMetaKey, jsan.stringify(this._meta, undefined, undefined, true));
